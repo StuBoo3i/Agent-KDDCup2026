@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import json
 import multiprocessing
+import os
+import traceback
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -11,6 +13,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from data_agent_baseline.agents.langgraph_agent import LangGraphAgentConfig, LangGraphReActAgent
 from data_agent_baseline.agents.model import OpenAIModelAdapter
 from data_agent_baseline.agents.react import ReActAgent, ReActAgentConfig
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
@@ -24,6 +27,7 @@ class TaskRunArtifacts:
     task_output_dir: Path
     prediction_csv_path: Path | None
     trace_path: Path
+    langgraph_mermaid_path: Path | None
     succeeded: bool
     failure_reason: str | None
 
@@ -33,6 +37,9 @@ class TaskRunArtifacts:
             "task_output_dir": str(self.task_output_dir),
             "prediction_csv_path": str(self.prediction_csv_path) if self.prediction_csv_path else None,
             "trace_path": str(self.trace_path),
+            "langgraph_mermaid_path": (
+                str(self.langgraph_mermaid_path) if self.langgraph_mermaid_path is not None else None
+            ),
             "succeeded": self.succeeded,
             "failure_reason": self.failure_reason,
         }
@@ -71,12 +78,12 @@ def build_model_adapter(config: AppConfig):
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as handle:
+    with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(columns)
         for row in rows:
@@ -102,12 +109,27 @@ def _run_single_task_core(
 ) -> dict[str, Any]:
     public_dataset = DABenchPublicDataset(config.dataset.root_path)
     task = public_dataset.get_task(task_id)
-
-    agent = ReActAgent(
-        model=model or build_model_adapter(config),
-        tools=tools or create_default_tool_registry(),
-        config=ReActAgentConfig(max_steps=config.agent.max_steps),
-    )
+    effective_model = model or build_model_adapter(config)
+    effective_tools = tools or create_default_tool_registry()
+    framework = config.agent.framework.lower()
+    if framework == "langgraph":
+        agent = LangGraphReActAgent(
+            model=effective_model,
+            tools=effective_tools,
+            config=LangGraphAgentConfig(
+                max_steps=config.agent.max_steps,
+                enable_langsmith=config.agent.enable_langsmith,
+                langsmith_project=config.agent.langsmith_project,
+            ),
+        )
+    elif framework == "react":
+        agent = ReActAgent(
+            model=effective_model,
+            tools=effective_tools,
+            config=ReActAgentConfig(max_steps=config.agent.max_steps),
+        )
+    else:
+        raise ValueError(f"Unsupported agent framework: {framework}")
     run_result = agent.run(task)
     return run_result.to_dict()
 
@@ -125,6 +147,7 @@ def _run_single_task_in_subprocess(task_id: str, config: AppConfig, queue: multi
             {
                 "ok": False,
                 "error": str(exc),
+                "traceback": traceback.format_exc(),
             }
         )
 
@@ -132,6 +155,10 @@ def _run_single_task_in_subprocess(task_id: str, config: AppConfig, queue: multi
 def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[str, Any]:
     timeout_seconds = config.run.task_timeout_seconds
     if timeout_seconds <= 0:
+        return _run_single_task_core(task_id=task_id, config=config)
+    # Windows multiprocessing can trigger encoding/env inconsistencies with some API stacks.
+    # Keep execution in-process unless explicitly overridden.
+    if os.name == "nt" and os.getenv("DABENCH_FORCE_SUBPROCESS", "0") != "1":
         return _run_single_task_core(task_id=task_id, config=config)
 
     queue: multiprocessing.Queue[Any] = multiprocessing.Queue()
@@ -162,6 +189,12 @@ def _run_single_task_with_timeout(*, task_id: str, config: AppConfig) -> dict[st
     result = queue.get()
     if result.get("ok"):
         return dict(result["run_result"])
+    traceback_text = str(result.get("traceback", "")).strip()
+    if traceback_text:
+        return _failure_run_result_payload(
+            task_id,
+            f"Task failed with uncaught error: {result['error']}\n{traceback_text}",
+        )
     return _failure_run_result_payload(task_id, f"Task failed with uncaught error: {result['error']}")
 
 
@@ -181,11 +214,20 @@ def _write_task_outputs(task_id: str, run_output_dir: Path, run_result: dict[str
             [list(row) for row in answer.get("rows", [])],
         )
 
+    langgraph_mermaid_path: Path | None = None
+    metadata = run_result.get("metadata")
+    if isinstance(metadata, dict):
+        mermaid = metadata.get("langgraph_mermaid")
+        if isinstance(mermaid, str) and mermaid.strip():
+            langgraph_mermaid_path = task_output_dir / "graph.mmd"
+            langgraph_mermaid_path.write_text(mermaid, encoding="utf-8")
+
     return TaskRunArtifacts(
         task_id=task_id,
         task_output_dir=task_output_dir,
         prediction_csv_path=prediction_csv_path,
         trace_path=trace_path,
+        langgraph_mermaid_path=langgraph_mermaid_path,
         succeeded=bool(run_result.get("succeeded")),
         failure_reason=run_result.get("failure_reason"),
     )
@@ -214,12 +256,13 @@ def run_benchmark(
     model=None,
     tools: ToolRegistry | None = None,
     limit: int | None = None,
+    difficulties: list[str] | None = None,
     progress_callback: Callable[[TaskRunArtifacts], None] | None = None,
 ) -> tuple[Path, list[TaskRunArtifacts]]:
     effective_run_id, run_output_dir = create_run_output_dir(config.run.output_dir, run_id=config.run.run_id)
 
     dataset = DABenchPublicDataset(config.dataset.root_path)
-    tasks = dataset.iter_tasks()
+    tasks = dataset.iter_tasks(difficulties=difficulties)
     if limit is not None:
         tasks = tasks[:limit]
 

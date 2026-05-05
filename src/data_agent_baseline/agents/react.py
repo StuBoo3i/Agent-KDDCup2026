@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from time import perf_counter
 
 from data_agent_baseline.agents.model import ModelAdapter, ModelMessage, ModelStep
 from data_agent_baseline.agents.prompt import (
@@ -11,7 +12,7 @@ from data_agent_baseline.agents.prompt import (
     build_system_prompt,
     build_task_prompt,
 )
-from data_agent_baseline.agents.runtime import AgentRunResult, AgentRuntimeState, StepRecord
+from data_agent_baseline.agents.runtime import AgentRunResult, AgentRuntimeState, StepRecord, utc_now_iso
 from data_agent_baseline.benchmark.schema import PublicTask
 from data_agent_baseline.tools.registry import ToolRegistry
 
@@ -97,7 +98,11 @@ class ReActAgent:
     def run(self, task: PublicTask) -> AgentRunResult:
         state = AgentRuntimeState()
         for step_index in range(1, self.config.max_steps + 1):
-            raw_response = self.model.complete(self._build_messages(task, state))
+            step_started_perf = perf_counter()
+            step_started_at = utc_now_iso()
+            messages = self._build_messages(task, state)
+            prompt_messages = [{"role": message.role, "content": message.content} for message in messages]
+            raw_response = self.model.complete(messages)
             try:
                 model_step = parse_model_step(raw_response)
                 tool_result = self.tools.execute(task, model_step.action, model_step.action_input)
@@ -114,6 +119,10 @@ class ReActAgent:
                     raw_response=raw_response,
                     observation=observation,
                     ok=tool_result.ok,
+                    started_at_utc=step_started_at,
+                    completed_at_utc=utc_now_iso(),
+                    elapsed_seconds=round(perf_counter() - step_started_perf, 3),
+                    prompt_messages=prompt_messages,
                 )
                 state.steps.append(step_record)
                 if tool_result.is_terminal:
@@ -133,6 +142,10 @@ class ReActAgent:
                         raw_response=raw_response,
                         observation=observation,
                         ok=False,
+                        started_at_utc=step_started_at,
+                        completed_at_utc=utc_now_iso(),
+                        elapsed_seconds=round(perf_counter() - step_started_perf, 3),
+                        prompt_messages=prompt_messages,
                     )
                 )
 

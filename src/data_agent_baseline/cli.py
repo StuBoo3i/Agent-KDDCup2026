@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from time import perf_counter
 
@@ -16,6 +17,11 @@ from rich.table import Table
 
 from data_agent_baseline.benchmark.dataset import DABenchPublicDataset
 from data_agent_baseline.config import load_app_config
+from data_agent_baseline.evaluation import evaluate_run_outputs, write_evaluation_artifacts
+from data_agent_baseline.langsmith_group_sync import (
+    sync_run_and_eval_to_langsmith,
+    sync_task_eval_to_runtime_trace,
+)
 from data_agent_baseline.run.runner import TaskRunArtifacts, create_run_output_dir, run_benchmark, run_single_task
 from data_agent_baseline.tools.filesystem import list_context_tree
 
@@ -95,6 +101,12 @@ def status(
     table.add_row("runs_dir", str(ARTIFACT_RUNS_DIR), _status_value(ARTIFACT_RUNS_DIR))
     table.add_row("dataset_root", str(app_config.dataset.root_path), _status_value(app_config.dataset.root_path))
     table.add_row("config_path", str(config_path), _status_value(config_path))
+    table.add_row("agent_framework", app_config.agent.framework, "ready")
+    table.add_row(
+        "langsmith",
+        app_config.agent.langsmith_project if app_config.agent.enable_langsmith else "disabled",
+        "enabled" if app_config.agent.enable_langsmith else "disabled",
+    )
 
     console.print(table)
 
@@ -134,8 +146,15 @@ def inspect_task(
 def run_task_command(
     task_id: str,
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+    gold_root: Path = typer.Option(
+        PROJECT_ROOT / "data" / "public" / "output",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Directory containing task_<id>/gold.csv files for post-run validation.",
+    ),
 ) -> None:
-    """Run the ReAct baseline on one task."""
+    """Run the configured agent framework on one task."""
     app_config = load_app_config(config)
     try:
         _, run_output_dir = create_run_output_dir(app_config.run.output_dir, run_id=app_config.run.run_id)
@@ -152,16 +171,93 @@ def run_task_command(
     if artifacts.failure_reason is not None:
         console.print(f"Failure: {artifacts.failure_reason}")
 
+    # Auto validation right after run-task to compare with public gold outputs.
+    summary = evaluate_run_outputs(run_output_dir, gold_root.resolve())
+    summary_json_path, details_csv_path = write_evaluation_artifacts(summary, run_output_dir)
+    console.print(f"Evaluation summary JSON: {summary_json_path}")
+    console.print(f"Evaluation details CSV: {details_csv_path}")
+    task_eval = next((item for item in summary.get("tasks", []) if item.get("task_id") == task_id), None)
+    if task_eval is not None:
+        console.print(
+            "Task eval: "
+            f"exact_match={task_eval.get('exact_match')} "
+            f"unordered_row_match={task_eval.get('unordered_row_match')} "
+            f"columns_match={task_eval.get('columns_match')} "
+            f"has_prediction={task_eval.get('has_prediction')} "
+            f"error={task_eval.get('error') or '-'}"
+        )
+
+    if app_config.agent.enable_langsmith:
+        try:
+            trace_payload = json.loads(artifacts.trace_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]LangSmith trace read failed:[/yellow] {exc}")
+            trace_payload = None
+
+        if task_eval is not None and isinstance(trace_payload, dict):
+            try:
+                runtime_sync = sync_task_eval_to_runtime_trace(
+                    trace_payload=trace_payload,
+                    task_eval_row=task_eval,
+                )
+                if runtime_sync.get("updated"):
+                    console.print(
+                        "LangSmith runtime trace updated: "
+                        f"run_id={runtime_sync.get('runtime_run_id')} "
+                        f"task_correct={runtime_sync.get('task_correct')} "
+                        f"verified={runtime_sync.get('verified')} "
+                        f"feedback_count={runtime_sync.get('feedback_count')}"
+                    )
+                    if runtime_sync.get("feedback_error"):
+                        console.print(
+                            "[yellow]LangSmith feedback warning:[/yellow] "
+                            f"{runtime_sync.get('feedback_error')}"
+                        )
+                else:
+                    console.print(
+                        "[yellow]LangSmith runtime update skipped:[/yellow] "
+                        f"{runtime_sync.get('reason')} "
+                        f"run_id={runtime_sync.get('runtime_run_id') or '-'} "
+                        f"trace_name={runtime_sync.get('task_trace_name') or '-'} "
+                        f"error={runtime_sync.get('error') or '-'}"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                console.print(f"[yellow]LangSmith runtime update failed:[/yellow] {exc}")
+
+        try:
+            sync_result = sync_run_and_eval_to_langsmith(
+                app_config=app_config,
+                run_output_dir=run_output_dir,
+                artifacts=[artifacts],
+                evaluation_summary=summary,
+                difficulty_filters=None,
+            )
+            console.print(
+                "LangSmith sync: "
+                f"project={sync_result['project_name']} "
+                f"run_group_id={sync_result['run_group_id']} "
+                f"task_runs={sync_result['task_run_count']} "
+                f"step_runs={sync_result['step_run_count']}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]LangSmith grouped sync failed:[/yellow] {exc}")
+
 
 @app.command("run-benchmark")
 def run_benchmark_command(
     config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
     limit: int | None = typer.Option(None, min=1, help="Maximum number of tasks to run."),
+    difficulty: list[str] = typer.Option(
+        [],
+        "--difficulty",
+        help="Filter by difficulty. Repeat the option for multiple values.",
+    ),
 ) -> None:
-    """Run the ReAct baseline on multiple tasks from the config selection."""
+    """Run the configured agent framework on multiple tasks from the config selection."""
     app_config = load_app_config(config)
     dataset = DABenchPublicDataset(app_config.dataset.root_path)
-    task_total = len(dataset.iter_tasks())
+    tasks = dataset.iter_tasks(difficulties=list(difficulty) or None)
+    task_total = len(tasks)
     if limit is not None:
         task_total = min(task_total, limit)
     effective_workers = app_config.run.max_workers
@@ -233,6 +329,7 @@ def run_benchmark_command(
             run_output_dir, artifacts = run_benchmark(
                 config=app_config,
                 limit=limit,
+                difficulties=list(difficulty) or None,
                 progress_callback=on_task_complete,
             )
         except (ValueError, FileExistsError) as exc:
@@ -255,6 +352,74 @@ def run_benchmark_command(
     console.print(f"Run output: {run_output_dir}")
     console.print(f"Tasks attempted: {len(artifacts)}")
     console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
+
+
+@app.command("run-and-eval")
+def run_and_evaluate_command(
+    config: Path = typer.Option(..., exists=True, dir_okay=False, help="YAML config path."),
+    limit: int | None = typer.Option(None, min=1, help="Maximum number of tasks to run."),
+    difficulty: list[str] = typer.Option(
+        [],
+        "--difficulty",
+        help="Filter by difficulty. Repeat the option for multiple values.",
+    ),
+    gold_root: Path = typer.Option(
+        PROJECT_ROOT / "data" / "public" / "output",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        help="Directory containing task_<id>/gold.csv files.",
+    ),
+) -> None:
+    """Run benchmark and evaluate prediction.csv against public gold.csv."""
+    app_config = load_app_config(config)
+    run_output_dir, artifacts = run_benchmark(
+        config=app_config,
+        limit=limit,
+        difficulties=list(difficulty) or None,
+    )
+    console.print(f"Run output: {run_output_dir}")
+    console.print(f"Tasks attempted: {len(artifacts)}")
+    console.print(f"Succeeded tasks: {sum(1 for item in artifacts if item.succeeded)}")
+
+    summary = evaluate_run_outputs(run_output_dir, gold_root.resolve())
+    summary_json_path, details_csv_path = write_evaluation_artifacts(summary, run_output_dir)
+
+    console.print(f"Evaluation summary JSON: {summary_json_path}")
+    console.print(f"Evaluation details CSV: {details_csv_path}")
+    console.print(
+        "Exact match: "
+        f"{summary['exact_match_count']}/{summary['task_count_evaluated']} "
+        f"({summary['exact_match_rate']:.2%})"
+    )
+    console.print(
+        "Unordered-row match: "
+        f"{summary['unordered_row_match_count']}/{summary['task_count_evaluated']} "
+        f"({summary['unordered_row_match_rate']:.2%})"
+    )
+    console.print(
+        f"Missing prediction: {summary['missing_prediction_count']}, "
+        f"Missing gold: {summary['missing_gold_count']}, Errors: {summary['error_count']}"
+    )
+
+    if app_config.agent.enable_langsmith:
+        try:
+            sync_result = sync_run_and_eval_to_langsmith(
+                app_config=app_config,
+                run_output_dir=run_output_dir,
+                artifacts=artifacts,
+                evaluation_summary=summary,
+                difficulty_filters=list(difficulty) or None,
+            )
+            console.print(
+                "LangSmith sync: "
+                f"project={sync_result['project_name']} "
+                f"run_group_id={sync_result['run_group_id']} "
+                f"task_runs={sync_result['task_run_count']} "
+                f"step_runs={sync_result['step_run_count']}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]LangSmith sync failed:[/yellow] {exc}")
 
 
 def main() -> None:

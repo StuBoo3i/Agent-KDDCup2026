@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from data_agent_baseline.benchmark.schema import AnswerTable
+
+
+def utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +20,10 @@ class StepRecord:
     raw_response: str
     observation: dict[str, Any]
     ok: bool
+    started_at_utc: str
+    completed_at_utc: str
+    elapsed_seconds: float
+    prompt_messages: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -33,6 +42,7 @@ class AgentRunResult:
     answer: AnswerTable | None
     steps: list[StepRecord]
     failure_reason: str | None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def succeeded(self) -> bool:
@@ -45,4 +55,5 @@ class AgentRunResult:
             "steps": [step.to_dict() for step in self.steps],
             "failure_reason": self.failure_reason,
             "succeeded": self.succeeded,
+            "metadata": dict(self.metadata),
         }

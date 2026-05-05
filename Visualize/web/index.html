@@ -1,0 +1,202 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>KDDCup Agent Run Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="module" src="./app.js" defer></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      window.__MERMAID__ = mermaid;
+    </script>
+  </head>
+  <body>
+    <div class="bg-pattern" aria-hidden="true"></div>
+    <header class="topbar">
+      <div class="title-wrap">
+        <p class="eyebrow">KDDCUP · Agent Monitor</p>
+        <h1>Runs Visual Dashboard</h1>
+      </div>
+      <div class="top-actions">
+        <button id="refreshBtn" class="btn btn-primary">刷新</button>
+        <button id="cleanupBtn" class="btn btn-danger">自动清理失败 Run</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel run-panel">
+        <div class="panel-title">
+          <h2>Run 列表</h2>
+          <span id="runCountBadge" class="badge">0</span>
+        </div>
+        <div class="run-filters">
+          <label class="form-field compact">
+            <span>状态</span>
+            <select id="filterStatus">
+              <option value="all">全部</option>
+              <option value="success">success</option>
+              <option value="partial">partial</option>
+              <option value="failed">failed</option>
+            </select>
+          </label>
+          <label class="form-field compact">
+            <span>评分</span>
+            <select id="filterScore">
+              <option value="all">全部</option>
+              <option value="unrated">未评分</option>
+              <option value="5">5</option>
+              <option value="4">4</option>
+              <option value="3">3</option>
+              <option value="2">2</option>
+              <option value="1">1</option>
+            </select>
+          </label>
+          <label class="form-field compact full">
+            <span>标签关键字</span>
+            <input id="filterLabel" type="text" maxlength="48" placeholder="例如 keep / retry / drop" />
+          </label>
+        </div>
+        <div id="runsList" class="runs-list"></div>
+      </section>
+
+      <section class="panel detail-panel">
+        <div class="panel-title">
+          <h2 id="runTitle">请选择一个 Run</h2>
+          <p id="runMetaText" class="muted"></p>
+        </div>
+        <div id="runStats" class="stat-grid"></div>
+
+        <div class="subpanel">
+          <div class="subpanel-title">
+            <h3>Run 评价</h3>
+            <p id="reviewStatus" class="muted"></p>
+          </div>
+          <div class="review-grid">
+            <label class="form-field">
+              <span>评分 (1-5)</span>
+              <select id="reviewScore">
+                <option value="">未评分</option>
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+                <option value="4">4</option>
+                <option value="5">5</option>
+              </select>
+            </label>
+            <label class="form-field">
+              <span>标签</span>
+              <input id="reviewLabel" type="text" maxlength="48" placeholder="例如: keep / retry / drop" />
+            </label>
+          </div>
+          <label class="form-field">
+            <span>备注</span>
+            <textarea id="reviewNote" rows="3" maxlength="4000" placeholder="记录这个 run 的优缺点和后续动作"></textarea>
+          </label>
+          <div class="review-actions">
+            <button id="saveReviewBtn" class="btn btn-primary">保存评价</button>
+            <button id="deleteRunBtn" class="btn btn-danger-outline">删除当前 Run</button>
+          </div>
+        </div>
+
+        <div class="subpanel">
+          <div class="subpanel-title">
+            <h3>Trace.json 说明</h3>
+          </div>
+          <div class="explain-grid">
+            <div class="explain-card">
+              <div class="explain-title">Prompts（输入给模型）</div>
+              <div class="explain-body">
+                每一步里看 <code>prompt_messages</code>。其中
+                <code>system</code> 是系统提示词，<code>user</code> 是任务描述和 observation。
+              </div>
+            </div>
+            <div class="explain-card">
+              <div class="explain-title">Assistant Message（模型输出）</div>
+              <div class="explain-body">
+                看 <code>raw_response</code>。这是模型原始返回文本，再被解析成
+                <code>thought/action/action_input</code>。
+              </div>
+            </div>
+            <div class="explain-card">
+              <div class="explain-title">Tool Message（工具结果）</div>
+              <div class="explain-body">
+                看 <code>observation</code>。它是工具执行结果，并会在下一轮作为 user observation prompt 送回模型。
+              </div>
+            </div>
+            <div class="explain-card">
+              <div class="explain-title">时间字段</div>
+              <div class="explain-body">
+                <code>started_at_utc</code> / <code>completed_at_utc</code> / <code>elapsed_seconds</code> 是 step 时间。
+                顶层 <code>e2e_elapsed_seconds</code> 是任务总耗时。
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="subpanel">
+          <div class="subpanel-title">
+            <h3>Task 评估结果</h3>
+          </div>
+          <div class="table-wrap">
+            <table id="taskTable">
+              <thead>
+                <tr>
+                  <th>Task</th>
+                  <th>Run状态</th>
+                  <th>Exact Match</th>
+                  <th>Columns</th>
+                  <th>Unordered</th>
+                  <th>步骤数</th>
+                  <th>错误</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="subpanel">
+          <div class="subpanel-title">
+            <h3 id="taskTitle">Trace 瀑布图</h3>
+            <p id="taskMeta" class="muted"></p>
+          </div>
+          <div id="traceWaterfall" class="waterfall-empty">请选择 task 查看 trace</div>
+          <details class="trace-details" open>
+            <summary>步骤详情</summary>
+            <div id="stepDetails"></div>
+          </details>
+        </div>
+
+        <div class="subpanel">
+          <div class="subpanel-title">
+            <h3>Prediction / Gold 预览</h3>
+          </div>
+          <div class="preview-grid">
+            <div class="csv-panel">
+              <div class="csv-panel-title">Prediction</div>
+              <div id="predictionBox" class="csv-box">暂无 prediction.csv</div>
+            </div>
+            <div class="csv-panel">
+              <div class="csv-panel-title">Gold</div>
+              <div id="goldBox" class="csv-box">暂无 gold.csv</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="subpanel">
+          <div class="subpanel-title">
+            <h3>Graph.mmd 可视化</h3>
+          </div>
+          <div id="mermaidBox" class="mermaid-box">暂无 graph.mmd</div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

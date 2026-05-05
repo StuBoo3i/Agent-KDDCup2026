@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+import time
 from typing import Any, Protocol
 
-from openai import APIError, OpenAI
+from openai import APIConnectionError, APIError, OpenAI
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,24 +40,51 @@ class OpenAIModelAdapter:
         self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.temperature = temperature
-
-    def complete(self, messages: list[ModelMessage]) -> str:
-        if not self.api_key:
-            raise RuntimeError("Missing model API key in config.agent.api_key.")
-
-        client = OpenAI(
+        self._client = OpenAI(
             api_key=self.api_key,
             base_url=self.api_base,
         )
 
-        try:
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": message.role, "content": message.content} for message in messages],
-                temperature=self.temperature
+    def _format_connection_error(self, exc: APIConnectionError) -> str:
+        cause = exc.__cause__
+        details = str(exc) or "Connection error."
+        if cause is not None:
+            details = f"{details} (cause: {cause})"
+        proxy_keys = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+        active_proxy_env = [key for key in proxy_keys if os.getenv(key)]
+        if active_proxy_env:
+            details = f"{details} [active proxy env: {', '.join(active_proxy_env)}]"
+        return details
+
+    def complete(self, messages: list[ModelMessage]) -> str:
+        if not self.api_key:
+            raise RuntimeError(
+                "Missing model API key. Set config.agent.api_key or environment variable OPENAI_API_KEY/DASHSCOPE_API_KEY."
             )
-        except APIError as exc:
-            raise RuntimeError(f"Model request failed: {exc}") from exc
+
+        max_attempts = 3
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self._client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": message.role, "content": message.content} for message in messages],
+                    temperature=self.temperature,
+                )
+                break
+            except APIConnectionError as exc:
+                last_exc = exc
+                if attempt >= max_attempts:
+                    raise RuntimeError(
+                        f"Model request failed after {max_attempts} attempts: {self._format_connection_error(exc)}"
+                    ) from exc
+                time.sleep(1.5 * attempt)
+            except APIError as exc:
+                raise RuntimeError(f"Model request failed: {exc}") from exc
+        else:
+            if last_exc is not None:
+                raise RuntimeError(f"Model request failed: {last_exc}") from last_exc
+            raise RuntimeError("Model request failed for unknown reasons.")
 
         choices = response.choices or []
         if not choices:
